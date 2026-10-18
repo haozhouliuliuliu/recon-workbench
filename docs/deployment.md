@@ -27,8 +27,28 @@ pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-阶段 1 不读取任何环境变量；`.env` 仅为阶段 2 的 LLM 配置预留。
+**程序不会自动加载 `.env`**：它只读进程环境变量。可以手动 `set -a; source .env`（bash）、
+`$env:LLM_API_KEY="..."`（PowerShell），或由部署平台/密钥管理服务注入。
 **`.env` 已在 `.gitignore` 中，不会被提交。**
+
+### LLM（阶段 2）
+
+| 变量 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `LLM_API_BASE` | 是 | — | 兼容 OpenAI 的地址，例如 `https://api.example.com/v1` |
+| `LLM_API_KEY` | 是 | — | 只走环境变量，不落盘、不入日志 |
+| `LLM_MODEL` | 是 | — | 服务商支持的模型名 |
+| `LLM_TIMEOUT_SECONDS` | 否 | 30 | 单次请求超时 |
+| `LLM_MAX_RETRIES` | 否 | 2 | 传输失败重试次数（总尝试 = 1 + 该值） |
+| `LLM_CONFIDENCE_THRESHOLD` | 否 | 0.85 | 低于该值转人工 |
+| `LLM_TEMPERATURE` | 否 | 0 | 建议保持 0，减少输出漂移 |
+| `LLM_JSON_MODE` | 否 | 1 | 是否发送 `response_format=json_object`；服务商不支持时设为 0 |
+
+没有密钥时仍可完整体验流程：
+
+```bash
+recon review --report out/recon_report.json --stub
+```
 
 ## 验证安装
 
@@ -39,13 +59,14 @@ pytest -q
 
 ## 离线环境
 
-阶段 1 的运行时依赖只有 `openpyxl` 与 `pydantic`。可在有网机器上执行：
+运行时依赖：`openpyxl`、`pydantic`、`httpx`。可在有网机器上执行：
 
 ```bash
 pip download -d wheels -e ".[dev]"
 ```
 
 把仓库与 `wheels/` 一并拷贝到离线机器，再 `pip install --no-index --find-links wheels -e .`。
+离线且没有 LLM 服务时，`recon review --stub` 仍然可用（本地假响应，不联网）。
 
 ## 常见问题
 
