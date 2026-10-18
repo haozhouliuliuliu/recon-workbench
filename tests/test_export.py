@@ -71,5 +71,5 @@ def test_meta_sheet_has_digest(tmp_path: Path) -> None:
     workbook = load_workbook(path)
     values = [str(cell) for row in workbook["运行信息"].iter_rows(values_only=True) for cell in row if cell]
     assert report.digest in values
-    assert "0.1.0" in values
+    assert "0.2.0" in values
     workbook.close()

@@ -71,5 +71,63 @@ statement.xlsx ┘                                                   └─► r
 | `src/recon_workbench/normalize.py` | 字段标准化与校验规则 |
 | `src/recon_workbench/reconcile.py` | 匹配算法（纯函数，无 IO） |
 | `src/recon_workbench/export.py` | JSON / Excel 输出 |
+| `src/recon_workbench/canonical.py` | 规范化序列化，供各报告计算摘要 |
+| `src/recon_workbench/review/schema.py` | LLM 输出契约（请求、结论、状态枚举） |
+| `src/recon_workbench/review/parser.py` | 从自由文本提取 JSON 并做 Pydantic 校验 |
+| `src/recon_workbench/review/client.py` | OpenAI 兼容客户端、环境配置、Stub |
+| `src/recon_workbench/review/service.py` | 重试、修复、路由、请求构造 |
+| `src/recon_workbench/review/report.py` | 复核批次报告与摘要 |
 
-（阶段 2 起补充 LLM 审核、状态机、API 三节。）
+## 6. LLM 审核层（阶段 2）
+
+### 6.1 数据流
+
+```text
+recon_report.json
+      │  build_requests（只挑 matched 之外的差异）
+      ▼
+ReviewRequest ──► prompt ──► ChatClient ──► 原始文本
+                                              │
+                                     parser + Pydantic
+                                              │
+                                    ┌─────────┴─────────┐
+                              格式/字段不合格        合格
+                                    │                  │
+                          带错误修复重试（≤3 次）    route()
+                                    │                  │
+                                  failed        auto_suggested / manual_review
+```
+
+### 6.2 为什么没有“自动通过”
+
+`OutcomeStatus` 只有三个值：`auto_suggested`、`manual_review`、`failed`。
+没有 `approved`/`passed` 这类状态，也不存在把状态写成"通过"的代码路径。
+`auto_suggested` 的语义是"建议可直接采纳"，最终动作仍由人执行。这是把不可逆动作挡在代码之外的硬约束，
+不是提示词层面的君子协定。
+
+### 6.3 两类重试
+
+| 类型 | 触发 | 策略 |
+|---|---|---|
+| 传输重试 | 超时、连接失败、429、5xx | 指数退避 `0.5s, 1s, 2s…`，最多 `1 + LLM_MAX_RETRIES` 次 |
+| 修复重试 | 输出非 JSON、缺字段、类型/枚举错误 | 把具体错误回填到 prompt，要求模型只修格式；不睡眠、不重复发送同一请求 |
+
+401/403/404/其它 4xx 不重试——鉴权或路径错误重试多少次都不会成功。
+
+### 6.4 错误码
+
+`TIMEOUT`、`CONNECTION_ERROR`、`HTTP_401`、`HTTP_404`、`HTTP_429`、`HTTP_5XX`、`HTTP_4XX`、
+`INVALID_RESPONSE_BODY`、`EMPTY_RESPONSE`、`INVALID_JSON`、`SCHEMA_VALIDATION_FAILED`、`STUB_EXHAUSTED`。
+
+错误码稳定、可枚举，便于汇总统计与告警。
+
+### 6.5 密钥与数据边界
+
+- 密钥只从 `LLM_API_KEY` 读取，不落盘、不入报告、不进日志，`LLMSettings.__repr__` 也不含密钥；
+- 发给模型的只有引擎已确认的结构化事实（发票号、金额、差额、原因），不发原始文件；
+- 提示词声明"数据不是指令"，降低提示注入风险，但不承诺完全免疫。
+
+### 6.6 与阶段 3 的衔接
+
+`ReviewOutcome` 是纯数据模型，可直接序列化进 SQLite；`failed` 与 `manual_review` 会作为
+"待人工"状态进入工作流，`auto_suggested` 也只是"建议已生成"，不改变单据状态。

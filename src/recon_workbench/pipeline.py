@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
+from . import __version__
+from .canonical import canonical_dumps
 from .config import Policy
 from .dedupe import find_duplicates
 from .ingest import RawTable, read_table
@@ -26,8 +27,6 @@ from .models import (
 )
 from .normalize import normalize_table
 from .reconcile import reconcile
-
-__version__ = "0.1.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,14 +96,7 @@ def _sort_issues(issues: list[Issue]) -> list[Issue]:
 def canonical_json(report: Report) -> bytes:
     """规范化 JSON：键排序、无空格、UTF-8、金额为字符串。"""
 
-    payload = report.model_dump(mode="json", exclude={"digest"})
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    return canonical_dumps(report.model_dump(mode="json", exclude={"digest"}))
 
 
 def run_reconciliation(
