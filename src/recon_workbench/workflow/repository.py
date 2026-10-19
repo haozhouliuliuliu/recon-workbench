@@ -66,8 +66,14 @@ def get_job(connection: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
     return connection.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
 
-def list_jobs(connection: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
-    return list(connection.execute("SELECT * FROM jobs ORDER BY created_at DESC, job_id LIMIT ?", (limit,)))
+def list_jobs(connection: sqlite3.Connection, limit: int = 20, offset: int = 0) -> list[sqlite3.Row]:
+    return list(
+        connection.execute("SELECT * FROM jobs ORDER BY created_at DESC, job_id LIMIT ? OFFSET ?", (limit, offset))
+    )
+
+
+def count_jobs(connection: sqlite3.Connection) -> int:
+    return int(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
 
 
 def set_job_status(
@@ -348,6 +354,10 @@ def upsert_artifact(
 
 def get_artifact(connection: sqlite3.Connection, job_id: str, kind: str) -> sqlite3.Row | None:
     return connection.execute("SELECT * FROM artifacts WHERE job_id = ? AND kind = ?", (job_id, kind)).fetchone()
+
+
+def list_artifacts(connection: sqlite3.Connection, job_id: str) -> list[sqlite3.Row]:
+    return list(connection.execute("SELECT * FROM artifacts WHERE job_id = ? ORDER BY kind", (job_id,)))
 
 
 # ---------------------------------------------------------------- helpers

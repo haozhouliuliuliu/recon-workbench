@@ -162,26 +162,25 @@ def _write_artifact(
     )
 
 
-def start_job(
+def create_job(
     connection: sqlite3.Connection,
     *,
     ledger_path: Path | str,
     statement_path: Path | str,
-    storage_dir: Path | str,
+    ledger_table: RawTable,
+    statement_table: RawTable,
     policy: Policy | None = None,
     review: ReviewSettings | None = None,
-    client_provider: ClientProvider | None = None,
-    force: bool = False,
-) -> WorkflowStatus:
-    """创建（或复用）任务并推进到"待人工/完成"状态。"""
+) -> str:
+    """登记任务（幂等），不执行阶段。
+
+    API 用它先返回 job_id，再把阶段推进交给后台任务。
+    """
 
     active_policy = policy or Policy()
     active_review = review or ReviewSettings()
     ledger = Path(ledger_path).resolve()
     statement = Path(statement_path).resolve()
-
-    ledger_table = read_table(ledger, SourceName.LEDGER)
-    statement_table = read_table(statement, SourceName.STATEMENT)
     job_id = compute_job_id(ledger_table.sha256, statement_table.sha256, active_policy, active_review)
 
     at = repo.now_iso()
@@ -202,6 +201,38 @@ def start_job(
         repo.ensure_stages(connection, job_id, STAGES)
         if created:
             repo.add_event(connection, job_id, "job_created", at=at, detail=f"inputs {ledger.name} / {statement.name}")
+    return job_id
+
+
+def start_job(
+    connection: sqlite3.Connection,
+    *,
+    ledger_path: Path | str,
+    statement_path: Path | str,
+    storage_dir: Path | str,
+    policy: Policy | None = None,
+    review: ReviewSettings | None = None,
+    client_provider: ClientProvider | None = None,
+    force: bool = False,
+) -> WorkflowStatus:
+    """创建（或复用）任务并推进到"待人工/完成"状态。"""
+
+    active_policy = policy or Policy()
+    active_review = review or ReviewSettings()
+    ledger = Path(ledger_path).resolve()
+    statement = Path(statement_path).resolve()
+
+    ledger_table = read_table(ledger, SourceName.LEDGER)
+    statement_table = read_table(statement, SourceName.STATEMENT)
+    job_id = create_job(
+        connection,
+        ledger_path=ledger,
+        statement_path=statement,
+        ledger_table=ledger_table,
+        statement_table=statement_table,
+        policy=active_policy,
+        review=active_review,
+    )
 
     return run_job(
         connection,
@@ -555,9 +586,9 @@ def get_status(connection: sqlite3.Connection, job_id: str) -> WorkflowStatus:
     )
 
 
-def list_jobs(connection: sqlite3.Connection, limit: int = 20) -> list[JobSummary]:
+def list_jobs(connection: sqlite3.Connection, limit: int = 20, offset: int = 0) -> list[JobSummary]:
     summaries: list[JobSummary] = []
-    for job in repo.list_jobs(connection, limit):
+    for job in repo.list_jobs(connection, limit, offset):
         pending = repo.pending_items(connection, job["job_id"])
         summaries.append(
             JobSummary(
