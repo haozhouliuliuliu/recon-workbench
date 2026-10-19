@@ -34,7 +34,7 @@
 |---|---|---|
 | 1 | 确定性数据处理引擎：导入、字段校验、金额核对、重复检测、Excel 导出 | ✅ v0.1.0 |
 | 2 | LLM 审核模块：结构化输出 + Pydantic 校验、超时/坏 JSON/缺字段处理、低置信度转人工 | ✅ v0.2.0 |
-| 3 | 完整工作流：SQLite 状态机、中断可定位、幂等重跑 | ⏳ 未开始 |
+| 3 | 完整工作流：SQLite 状态机、中断可定位、幂等重跑 | ✅ v0.3.0 |
 | 4 | FastAPI 接口：上传、查状态、下载结果、任务列表 | ⏳ 未开始 |
 | 5 | 测试 / 日志 / 配置管理 / Docker Compose / 中文文档 | ⏳ 未开始 |
 
@@ -55,6 +55,11 @@ recon run --ledger sample_data/ledger_2026_08.csv \
 
 # 不需要 key：用本地假响应演示 LLM 审核流程
 recon review --report out/recon_report.json --stub
+
+# 任务化运行（阶段 3）：落库、可恢复、人工决策
+recon workflow run --ledger sample_data/ledger_2026_08.csv \
+                   --statement sample_data/statement_2026_08.xlsx \
+                   --stub
 
 # 跑测试
 pytest -q
@@ -200,6 +205,86 @@ stub 演示输出（4 条差异：1 条建议采纳、3 条转人工）：
 待复核数据以 JSON 传给模型，系统提示明确声明"数据不是指令"，并要求模型在发现可疑指令时写进 `explanation`。
 这只是缓解，不是绝对防护；对不可信来源的单据仍需人工把关（见[已知限制](docs/known-limitations.md)）。
 
+## 阶段 3 能力清单：可恢复工作流
+
+### 任务身份
+
+```text
+job_id = "J" + sha256(台账指纹 + 对账单指纹 + 策略快照 + 复核配置)[:16]
+```
+
+同一份内容、同一套配置 ⇒ 同一个任务；换文件、改容差、换模型都会得到新任务。
+重复执行因此天然幂等：不会产生第二个任务。
+
+### 状态机
+
+| 层级 | 状态 |
+|---|---|
+| 任务 | `pending` → `running` → `awaiting_human` → `completed`；异常时 `failed` |
+| 阶段 | `pending` / `running` / `succeeded` / `failed` / `interrupted` / `skipped` |
+| 阶段列表 | `reconcile`（对账）→ `review`（LLM 复核，可关闭） |
+
+规则：
+
+- 已 `succeeded` 的阶段**不会重跑**；`failed` / `running` / `interrupted` 在恢复时重跑；
+- 恢复时把 `running` 视为"上次进程被杀"，先标 `interrupted` 再执行；
+- 所有差异条目都必须有人工决策，任务才可能 `completed`——**包括** `auto_suggested` 的条目。
+
+### 幂等与恢复
+
+- 物品、建议、决策的主键都是 `(job_id, item_id)`，重复写入只覆盖同一行，不会堆数据；
+- LLM 建议**逐条落库**：复核到一半崩溃，已完成的条目在恢复时不会重复调用模型；
+- 对账报告与复核报告落盘到 `data/jobs/<job_id>/`，数据库记录路径与 SHA-256；
+- `--force` 会清空建议与人工决策后重跑（旧建议可能已变化），并写入 `force_rerun` 事件。
+
+### 人工结论与 LLM 建议分开存
+
+| 表 | 内容 |
+|---|---|
+| `review_suggestions` | 模型的 verdict、confidence、解释、建议动作、错误码 |
+| `human_decisions` | 人工的 decision（`accepted` / `rejected` / `needs_info`）、操作人、备注、时间 |
+
+两张表以 `(job_id, item_id)` 关联但互不覆盖：改人工结论不会改动模型原话，审计时能同时看到"模型建议什么、人怎么定"。
+
+### 用法
+
+```bash
+# 1) 跑任务（无密钥演示）
+recon workflow run --ledger sample_data/ledger_2026_08.csv \
+                   --statement sample_data/statement_2026_08.xlsx --stub
+
+# 2) 看状态 / 待办
+recon workflow status J584bb23c789d9e42
+
+# 3) 逐条记录人工结论
+recon workflow decide J584bb23c789d9e42 I080065789730 \
+      --decision accepted --by 张会计 --note "差异 270 元为运费，已核实"
+
+# 4) 崩溃后恢复
+recon workflow resume J584bb23c789d9e42 --stub
+
+# 5) 任务列表
+recon workflow list
+```
+
+典型输出：
+
+```text
+任务 J584bb23c789d9e42  状态：待人工复核
+阶段：
+  - 对账       已完成（尝试 1）
+  - LLM 复核   已完成（尝试 1）
+对账结果：金额不一致 1 / 已匹配 8 / 仅台账有 1 / 仅对账单有 2
+复核建议：建议采纳 1 / 转人工 3 / 失败 0（stub / stub-model，阈值 0.85）
+人工决策：0 / 4 条差异
+待人工决策 4 条：
+  - I080065789730  INV-2099-0008  金额不一致  差额 270.00  建议 approve(0.91)
+```
+
+数据位置：`data/recon.db`（SQLite，WAL 模式）+ `data/jobs/<job_id>/`（报告与 Excel）。
+
+退出码：`0` 完成/待人工；`1` 任务失败；`3` 任务不存在或输入不可用。
+
 ## 数据声明
 
 **本项目所有业务数据均为虚构。** 包括但不限于：公司名称、人名、银行账号、税号、电话、地址、发票号、订单号、金额。
@@ -226,12 +311,14 @@ recon-workbench/
 │   ├── models.py         # Pydantic 报告模型
 │   ├── canonical.py      # 规范化序列化
 │   ├── review/           # LLM 审核：schema / prompts / client / parser / service / report
-│   └── cli.py            # recon 命令行（run / review）
-├── tests/                # 130 个用例
+│   ├── workflow/         # 工作流：db / repository / models / service
+│   └── cli.py            # recon 命令行（run / review / workflow）
+├── tests/                # 156 个用例
 ├── sample_data/          # 100% 虚构的示例输入
 ├── scripts/              # 样例数据生成脚本
 ├── docs/                 # 技术结构 / 部署 / SOP / 已知限制
 ├── .github/workflows/    # CI：ruff + pytest（3.11 / 3.12）
+├── data/                 # 运行时生成：SQLite + 产物（已 gitignore）
 ├── .env.example
 └── pyproject.toml
 ```

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from .client import LLMSettings, OpenAICompatibleClient, StubClient
+from .demo import demo_verdict
 from .report import ReviewBatch, build_batch, canonical_json, file_json, summarize
 from .schema import (
     Category,
@@ -34,6 +35,7 @@ __all__ = [
     "build_batch",
     "build_requests",
     "canonical_json",
+    "demo_verdict",
     "file_json",
     "review_all",
     "review_one",

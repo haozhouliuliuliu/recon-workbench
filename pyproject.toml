@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recon-workbench"
-version = "0.2.0"
+version = "0.3.0"
 description = "企业对账与单据审核工作台（全部数据为虚构，仅用于公开练手展示）"
 readme = "README.md"
 requires-python = ">=3.11"
