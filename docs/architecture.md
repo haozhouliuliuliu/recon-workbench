@@ -1,6 +1,6 @@
 # 技术结构说明
 
-> 本文档在阶段 5 定稿，当前为骨架。任何与代码不一致的描述都算缺陷，发现请提 issue。
+> 本文档描述当前实现的架构与数据流；如与代码不一致，以代码和测试为准。
 
 ## 1. 设计原则
 
@@ -12,7 +12,7 @@
 ## 2. 分层
 
 ```text
-CLI / HTTP API            （阶段 4）
+CLI / HTTP API
       │
       ▼
 Pipeline（编排）           pipeline.py
@@ -21,11 +21,11 @@ Pipeline（编排）           pipeline.py
       ├── Normalize        normalize.py   字段标准化 + 校验 → Entry / Issue
       ├── Dedupe           dedupe.py      重复与疑似重复检测
       ├── Reconcile        reconcile.py   台账 ↔ 对账单匹配
-      ├── Review（阶段 2）  review/        LLM 审核 + Pydantic 校验 + 转人工
+      ├── Review  review/        LLM 审核 + Pydantic 校验 + 转人工
       └── Export           export.py      规范化 JSON + 中文 Excel
 ```
 
-## 3. 阶段 1 的数据流
+## 3. 对账数据流
 
 ```text
 ledger.csv ─┐
@@ -86,7 +86,7 @@ statement.xlsx ┘                                                   └─► r
 | `src/recon_workbench/settings.py` | 环境变量配置与校验 |
 | `src/recon_workbench/logging_config.py` | 文本 / JSON 日志 |
 
-## 6. LLM 审核层（阶段 2）
+## 6. LLM 审核层
 
 ### 6.1 数据流
 
@@ -135,12 +135,12 @@ ReviewRequest ──► prompt ──► ChatClient ──► 原始文本
 - 发给模型的只有引擎已确认的结构化事实（发票号、金额、差额、原因），不发原始文件；
 - 提示词声明"数据不是指令"，降低提示注入风险，但不承诺完全免疫。
 
-### 6.6 与阶段 3 的衔接
+### 6.6 与工作流的衔接
 
 `ReviewOutcome` 是纯数据模型，可直接序列化进 SQLite；`failed` 与 `manual_review` 会作为
 "待人工"状态进入工作流，`auto_suggested` 也只是"建议已生成"，不改变单据状态。
 
-## 7. 工作流与状态机（阶段 3）
+## 7. 工作流与状态机
 
 ### 7.1 表结构
 
@@ -190,9 +190,9 @@ LLM 建议与人工结论是两类事实：前者是"模型说了什么"，后�
 ### 7.5 并发与部署边界
 
 当前假设**单机、单写进程**：SQLite 开 WAL 与 `busy_timeout=5s`，能容忍 CLI/测试/API 的轻度并发。
-阶段 4 增加了**进程内任务锁**（见 8.3），但仍是单进程方案；多 worker/多副本需要数据库抢占，见已知限制。
+HTTP 接口层增加了**进程内任务锁**（见 8.3），但仍是单进程方案；多 worker/多副本需要数据库抢占，见已知限制。
 
-## 8. HTTP 接口层（阶段 4）
+## 8. HTTP 接口层
 
 ### 8.1 分层
 
@@ -249,7 +249,7 @@ POST /api/jobs
 产物路径来自数据库，但下载前会 `resolve()` 并校验必须位于 `RECON_STORAGE_DIR` 下，
 防止数据库被篡改后读到任意文件（有测试覆盖）。
 
-## 9. 配置与日志（阶段 5）
+## 9. 配置与日志
 
 ### 9.1 配置
 
