@@ -35,8 +35,8 @@
 | 1 | 确定性数据处理引擎：导入、字段校验、金额核对、重复检测、Excel 导出 | ✅ v0.1.0 |
 | 2 | LLM 审核模块：结构化输出 + Pydantic 校验、超时/坏 JSON/缺字段处理、低置信度转人工 | ✅ v0.2.0 |
 | 3 | 完整工作流：SQLite 状态机、中断可定位、幂等重跑 | ✅ v0.3.0 |
-| 4 | FastAPI 接口：上传、查状态、下载结果、任务列表 | ⏳ 未开始 |
-| 5 | 测试 / 日志 / 配置管理 / Docker Compose / 中文文档 | ⏳ 未开始 |
+| 4 | FastAPI 接口：上传、查状态、下载结果、任务列表 | ✅ v0.4.0 |
+| 5 | 测试 / 日志 / 配置管理 / Docker Compose / 中文文档 | ✅ v0.4.0 |
 
 ## 快速开始
 
@@ -60,6 +60,9 @@ recon review --report out/recon_report.json --stub
 recon workflow run --ledger sample_data/ledger_2026_08.csv \
                    --statement sample_data/statement_2026_08.xlsx \
                    --stub
+
+# HTTP 接口（阶段 4）：文档在 http://127.0.0.1:8000/docs
+recon api
 
 # 跑测试
 pytest -q
@@ -285,6 +288,70 @@ recon workflow list
 
 退出码：`0` 完成/待人工；`1` 任务失败；`3` 任务不存在或输入不可用。
 
+## 阶段 4 能力清单：HTTP 接口
+
+启动：
+
+```bash
+pip install -e ".[server]"
+recon api                 # http://127.0.0.1:8000，文档在 /docs
+# 或：docker compose up --build
+```
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/jobs` | 上传台账 + 对账单（multipart），立即返回 `job_id`，对账/复核在后台执行 |
+| `GET` | `/api/jobs` | 任务列表（`limit` / `offset` / `total`） |
+| `GET` | `/api/jobs/{job_id}` | 任务详情：阶段状态、对账结果、建议、决策、事件 |
+| `GET` | `/api/jobs/{job_id}/artifacts` | 产物清单（类型、大小、SHA-256、下载地址） |
+| `GET` | `/api/jobs/{job_id}/download/{kind}` | 下载 `recon_report` / `recon_result` / `review_report` |
+| `POST` | `/api/jobs/{job_id}/decisions` | 记录人工结论（`accepted` / `rejected` / `needs_info`） |
+| `POST` | `/api/jobs/{job_id}/resume` | 从中断/失败处恢复 |
+| `GET` | `/healthz` | 健康检查（含数据库连通性） |
+
+### 一次完整调用
+
+```bash
+# 1) 上传（无密钥演示用 stub；真实模型由服务端环境变量决定）
+curl -s -X POST http://127.0.0.1:8000/api/jobs \
+  -F "ledger=@sample_data/ledger_2026_08.csv" \
+  -F "statement=@sample_data/statement_2026_08.xlsx"
+# {"job_id":"J584bb23c789d9e42","status":"pending","created":true,"detail_url":"/api/jobs/J584bb23c789d9e42"}
+
+# 2) 轮询
+curl -s http://127.0.0.1:8000/api/jobs/J584bb23c789d9e42 | jq '.status, .counts'
+
+# 3) 记录人工结论
+curl -s -X POST http://127.0.0.1:8000/api/jobs/J584bb23c789d9e42/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"item_id":"I080065789730","decision":"accepted","decided_by":"张会计","note":"运费已核实"}'
+
+# 4) 下载
+curl -OJ http://127.0.0.1:8000/api/jobs/J584bb23c789d9e42/download/recon_result
+```
+
+### 并发与错误
+
+- **任务锁**：同一进程内同一任务只允许一个后台任务推进；`resume` 撞上执行中返回 `409 JOB_BUSY`。
+- **后台任务**：上传接口不做长时间计算；阶段推进在线程池执行，失败只记日志与服务状态，不拖垮请求。
+- **错误结构**：`{"code": "...", "message": "..."}`；校验失败是 `422 VALIDATION_ERROR`，上传格式问题 `400`，文件过大 `413`，任务不存在 `404`，LLM 未配置 `503`。
+
+> 接口默认**不带鉴权**，只适合本地/内网演示；公网部署前必须加认证与 TLS（见[已知限制](docs/known-limitations.md)）。
+
+## 阶段 5 能力清单：工程化
+
+| 项 | 落地 |
+|---|---|
+| 测试 | 200 个用例，覆盖引擎 / LLM / 工作流 / API / 配置 / 日志；`pytest -q` |
+| 覆盖率 | 整体 91%（`--cov=recon_workbench`），核心模块 90%+ |
+| 日志 | `RECON_LOG_JSON=1` 输出单行 JSON；请求日志带 `request_id`、耗时、状态码；密钥与请求体不入日志 |
+| 配置管理 | 全部走环境变量，启动即校验；`recon config show` 查看生效配置（密钥只显示是否配置） |
+| Docker | 多阶段无需构建工具的单阶段镜像、非 root 运行、healthcheck；`docker compose up --build` |
+| CI | ruff + pytest（3.11/3.12）+ 样例冒烟 + **镜像构建与容器内端到端上传/下载** |
+| 文档 | 中文 README、部署指南、SOP、技术结构、已知限制 |
+
 ## 数据声明
 
 **本项目所有业务数据均为虚构。** 包括但不限于：公司名称、人名、银行账号、税号、电话、地址、发票号、订单号、金额。
@@ -312,23 +379,34 @@ recon-workbench/
 │   ├── canonical.py      # 规范化序列化
 │   ├── review/           # LLM 审核：schema / prompts / client / parser / service / report
 │   ├── workflow/         # 工作流：db / repository / models / service
-│   └── cli.py            # recon 命令行（run / review / workflow）
-├── tests/                # 156 个用例
+│   ├── api/              # FastAPI：app / models / locks
+│   ├── settings.py       # 环境变量配置与校验
+│   ├── logging_config.py # 文本 / JSON 日志
+│   └── cli.py            # recon 命令行（run / review / workflow / config / api）
+├── tests/                # 200 个用例
 ├── sample_data/          # 100% 虚构的示例输入
 ├── scripts/              # 样例数据生成脚本
 ├── docs/                 # 技术结构 / 部署 / SOP / 已知限制
-├── .github/workflows/    # CI：ruff + pytest（3.11 / 3.12）
+├── .github/workflows/    # CI：ruff + pytest + Docker 端到端
+├── Dockerfile            # 非 root 运行、healthcheck
+├── docker-compose.yml    # 单服务 + 命名卷
 ├── data/                 # 运行时生成：SQLite + 产物（已 gitignore）
 ├── .env.example
 └── pyproject.toml
 ```
 
-## 附加能力（可选，优先级最低）
+## 未做事项与后续路线
 
-> 仅在主线五阶段全部完成并达标后才会动手。
+主线五阶段已交付。以下内容**明确未做**，不假装完成：
 
-**Excel 母版套打**：读入用户自己的对账单母版，只填数据、保留原有公式与版式，而不是生成固定样式的报告。
-适用于"母版是结构与视觉权威、程序只填数"的真实工作流。当前未实现，阶段 1–5 均不依赖它。
+| 项 | 状态 | 说明 |
+|---|---|---|
+| Excel 母版套打 | ❌ 未实现 | 读入用户母版、只填数据并保留公式/版式。属于可选附加项，优先级最低；当前 Excel 是代码生成的报告样式 |
+| 接口鉴权 / 多租户 | ❌ 未实现 | 目前无认证、无权限体系，只适合本地或内网演示 |
+| 多 worker / 多节点 | ❌ 不支持 | SQLite + 进程内锁是单进程假设；扩展需要 PostgreSQL + 数据库抢占 |
+| 任务调度 / 自动重试 | ❌ 未实现 | 失败任务需人工 `resume`，没有定时器或队列 |
+| 产物 GC / 归档 | ❌ 未实现 | `data/jobs/` 会持续增长 |
+| 真实银行/ERP 对接、真实资金操作 | ❌ 刻意不做 | 本项目是虚构数据的练手项目 |
 
 ## 开发
 
