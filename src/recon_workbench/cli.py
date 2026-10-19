@@ -35,6 +35,7 @@ from .review import (
 from .review import (
     file_json as review_file_json,
 )
+from .settings import AppSettings
 from .workflow import (
     HumanDecision,
     JobNotFound,
@@ -143,6 +144,15 @@ def _build_parser() -> argparse.ArgumentParser:
     workflow_decide.add_argument("--quiet", action="store_true")
     workflow_decide.add_argument("--json", action="store_true")
 
+    config = subparsers.add_parser("config", help="查看生效配置（不含密钥）")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_show = config_sub.add_parser("show", help="打印当前配置")
+    config_show.add_argument("--json", action="store_true", help="JSON 输出")
+
+    api = subparsers.add_parser("api", help="启动 HTTP 接口（阶段 4）")
+    api.add_argument("--host", default=None, help="监听地址，默认取 RECON_HOST")
+    api.add_argument("--port", type=int, default=None, help="端口，默认取 RECON_PORT")
+
     return parser
 
 
@@ -169,6 +179,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_review(args)
     if args.command == "workflow":
         return _cmd_workflow(args)
+    if args.command == "config":
+        return _cmd_config(args)
+    if args.command == "api":
+        return _cmd_api(args)
 
     parser.print_help()  # pragma: no cover - argparse 已保证
     return EXIT_INPUT
@@ -563,6 +577,55 @@ def _status_label(value: str) -> str:
         return Status(value).label_zh
     except ValueError:
         return value
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    try:
+        settings = AppSettings.from_env()
+    except ConfigError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+    payload = settings.describe()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return EXIT_OK
+    for key, value in payload.items():
+        print(f"{key}: {value}")
+    return EXIT_OK
+
+
+def _cmd_api(args: argparse.Namespace) -> int:
+    try:
+        settings = AppSettings.from_env()
+    except ConfigError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+    host = args.host or settings.api_host
+    port = args.port or settings.api_port
+    if not 1 <= port <= 65535:
+        print("错误：--port 必须在 1..65535 之间", file=sys.stderr)
+        return EXIT_INPUT
+
+    try:
+        import uvicorn
+    except ImportError:
+        print('错误：未安装服务端依赖，请执行 pip install -e ".[server]"', file=sys.stderr)
+        return EXIT_INPUT
+
+    from .api import create_app
+
+    application = create_app(settings)
+    print(f"API 启动：http://{host}:{port}  文档：/docs")
+    uvicorn.run(
+        application,
+        host=host,
+        port=port,
+        log_config=None,
+        access_log=False,
+    )
+    return EXIT_OK
 
 
 if __name__ == "__main__":  # pragma: no cover
