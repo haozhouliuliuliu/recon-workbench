@@ -107,12 +107,24 @@ def run_reconciliation(
     ledger_sheet: str | None = None,
     statement_sheet: str | None = None,
 ) -> RunResult:
-    """跑一次完整对账，返回报告与规范化 JSON。"""
-
-    active_policy = policy or Policy()
+    """读文件并跑一次完整对账。"""
 
     ledger_table = read_table(ledger_path, SourceName.LEDGER, sheet=ledger_sheet)
     statement_table = read_table(statement_path, SourceName.STATEMENT, sheet=statement_sheet)
+    return run_from_tables(ledger_table, statement_table, policy)
+
+
+def run_from_tables(
+    ledger_table: RawTable,
+    statement_table: RawTable,
+    policy: Policy | None = None,
+) -> RunResult:
+    """确定性引擎主体：已读入的两张表 → 报告。
+
+    工作流层会先读表拿到指纹（用于任务幂等），再复用本函数，避免重复读盘。
+    """
+
+    active_policy = policy or Policy()
 
     ledger_entries, ledger_invalid, ledger_issues = normalize_table(ledger_table, active_policy)
     statement_entries, statement_invalid, statement_issues = normalize_table(statement_table, active_policy)
