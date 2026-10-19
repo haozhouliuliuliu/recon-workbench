@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recon-workbench"
-version = "0.3.0"
+version = "0.4.0"
 description = "企业对账与单据审核工作台（全部数据为虚构，仅用于公开练手展示）"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,6 +28,11 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
   "pytest-cov>=5,<7",
+  "httpx2>=2.14,<3",
+  # 开发时也装上服务端依赖，保证 pytest 能跑完整用例集
+  "fastapi>=0.111,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "python-multipart>=0.0.9,<1",
 ]
 server = [
   "fastapi>=0.111,<1",

@@ -1,0 +1,33 @@
+name: recon-workbench
+
+services:
+  api:
+    build: .
+    image: recon-workbench:0.4.0
+    ports:
+      - "8000:8000"
+    environment:
+      # 演示默认用本地 stub，无需密钥；接真实模型时改成 openai 并注入 LLM_*
+      RECON_REVIEW_PROVIDER: ${RECON_REVIEW_PROVIDER:-stub}
+      RECON_REVIEW_THRESHOLD: ${RECON_REVIEW_THRESHOLD:-0.85}
+      RECON_LOG_JSON: ${RECON_LOG_JSON:-1}
+      RECON_LOG_LEVEL: ${RECON_LOG_LEVEL:-INFO}
+      LLM_API_BASE: ${LLM_API_BASE:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+    volumes:
+      - recon-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  recon-data:

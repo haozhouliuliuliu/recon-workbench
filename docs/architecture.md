@@ -81,6 +81,10 @@ statement.xlsx ┘                                                   └─► r
 | `src/recon_workbench/workflow/repository.py` | 纯 SQL 数据访问（幂等 upsert） |
 | `src/recon_workbench/workflow/models.py` | 工作流视图模型与状态枚举 |
 | `src/recon_workbench/workflow/service.py` | 任务身份、阶段推进、恢复、人工决策 |
+| `src/recon_workbench/api/app.py` | FastAPI 路由、错误处理、后台任务、下载 |
+| `src/recon_workbench/api/locks.py` | 进程内任务锁 |
+| `src/recon_workbench/settings.py` | 环境变量配置与校验 |
+| `src/recon_workbench/logging_config.py` | 文本 / JSON 日志 |
 
 ## 6. LLM 审核层（阶段 2）
 
@@ -185,6 +189,78 @@ LLM 建议与人工结论是两类事实：前者是"模型说了什么"，后�
 
 ### 7.5 并发与部署边界
 
-当前假设**单机、单写进程**：SQLite 开 WAL 与 `busy_timeout=5s`，能容忍 CLI/测试/后续 API 的轻度并发，
-但没有任务级锁。同一任务被两个进程同时 `resume` 时，阶段可能各跑一次（结果仍幂等，但会重复调用模型）。
-阶段 4 引入 API 后，用进程内锁或"阶段抢占"字段解决。
+当前假设**单机、单写进程**：SQLite 开 WAL 与 `busy_timeout=5s`，能容忍 CLI/测试/API 的轻度并发。
+阶段 4 增加了**进程内任务锁**（见 8.3），但仍是单进程方案；多 worker/多副本需要数据库抢占，见已知限制。
+
+## 8. HTTP 接口层（阶段 4）
+
+### 8.1 分层
+
+```text
+FastAPI 路由
+  ├─ 请求校验（Pydantic / 文件后缀 / 大小）
+  ├─ 调用 workflow.service（不复制业务规则）
+  └─ 序列化 WorkflowStatus / 产物下载
+```
+
+接口里没有任何对账、匹配或重试逻辑：它只是工作流服务的一层薄封装，CLI 与 API 的行为因此一致。
+
+### 8.2 上传与后台执行
+
+```text
+POST /api/jobs
+  ├─ 分块读取上传（限制大小）
+  ├─ 计算文件 SHA-256 → job_id
+  ├─ 落盘 uploads/<job_id>/ledger.* / statement.*
+  ├─ read_table 校验表头（失败清理并 400）
+  ├─ create_job 登记任务（幂等）
+  ├─ BackgroundTasks 调度 _process_job
+  └─ 202 {job_id, status, detail_url}
+```
+
+`_process_job` 运行在线程池：自己开 SQLite 连接、拿任务锁、调 `run_job`/`resume_job`。
+因此上传请求不会被 LLM 调用或大文件处理阻塞。
+
+### 8.3 任务锁
+
+`JobLockRegistry` 是 `threading.Lock` 的注册表：
+
+- 后台任务 `try_acquire`，拿不到说明已有同任务在执行 → 记日志并跳过（幂等）；
+- `resume` / `decisions` 先用 `is_busy` 判断，返回 `409 JOB_BUSY`；
+- 锁只在单进程内有效。多 worker 时每个 worker 各有一份注册表，需要数据库层抢占（未实现）。
+
+### 8.4 错误约定
+
+| 场景 | HTTP | code |
+|---|---|---|
+| 参数/枚举不合法 | 422 | `VALIDATION_ERROR` |
+| 上传文件类型/表头不对 | 400 | `UNSUPPORTED_FILE_TYPE` / `INVALID_INPUT` |
+| 文件超过上限 | 413 | `FILE_TOO_LARGE` |
+| 任务不存在 | 404 | `JOB_NOT_FOUND` |
+| 任务执行中 | 409 | `JOB_BUSY` |
+| 人工决策不合法（如对 matched 条目） | 400 | `WORKFLOW_ERROR` |
+| LLM 未配置 | 503 | `CONFIG_ERROR` |
+| 数据库不可用 | 503 | `DATABASE_ERROR` |
+
+所有错误体统一为 `{"code","message"}`；校验错误额外带 `errors` 数组。
+
+### 8.5 下载安全
+
+产物路径来自数据库，但下载前会 `resolve()` 并校验必须位于 `RECON_STORAGE_DIR` 下，
+防止数据库被篡改后读到任意文件（有测试覆盖）。
+
+## 9. 配置与日志（阶段 5）
+
+### 9.1 配置
+
+- 全部来自环境变量，`AppSettings.from_env` 在启动时校验类型与取值范围；
+- 引擎策略（容差、正则等）仍走 TOML，可用 `RECON_POLICY_FILE` 指定；
+- `recon config show` 输出可公开快照，密钥只显示 `llm_api_key_configured: true/false`；
+- 复核配置（provider/model/threshold）参与任务身份，改配置 = 新任务。
+
+### 9.2 日志
+
+- `setup_logging` 幂等，不会叠加 handler；
+- `RECON_LOG_JSON=1` 时每行一个 JSON，包含 `ts`、`level`、`logger`、`message` 与业务字段；
+- 请求中间件记录 `request_id`、方法、路径、状态码、耗时，并回写 `X-Request-ID`；
+- 不记录请求体、上传内容与密钥；LLM 失败只记录错误码与截断后的信息。

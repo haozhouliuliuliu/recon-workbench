@@ -177,7 +177,70 @@ recon workflow run ... --force
 
 把输入文件、`data/` 目录一起归档，事后可完整复现当次结论与人工动作。
 
-## 8. 退出码
+## 8. 通过 HTTP 接口操作（阶段 4）
+
+### 8.1 启动
+
+```bash
+recon api
+# 默认 http://127.0.0.1:8000，交互文档 /docs，健康检查 /healthz
+```
+
+演示默认 `RECON_REVIEW_PROVIDER=stub`，不联网；接真实模型见[部署指南](deployment.md)。
+
+### 8.2 上传
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/jobs \
+  -F "ledger=@台账.csv" \
+  -F "statement=@对账单.xlsx"
+```
+
+返回 `202` 和 `job_id`。接口立即返回，对账与复核在后台执行。
+
+### 8.3 轮询
+
+```bash
+curl -s http://127.0.0.1:8000/api/jobs/<job_id>
+```
+
+看 `status`：
+
+| status | 含义 |
+|---|---|
+| `pending` / `running` | 后台还在跑 |
+| `awaiting_human` | 已出结果，等待人工结论 |
+| `completed` | 全部差异已有结论 |
+| `failed` | 阶段失败，看 `error` 与 `events`，再 `POST .../resume` |
+
+### 8.4 提交人工结论
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/jobs/<job_id>/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"item_id":"I080065789730","decision":"accepted","decided_by":"张会计","note":"运费已核实"}'
+```
+
+一次一条；`item_id` 来自 `GET /api/jobs/<job_id>` 的 `pending`。
+
+### 8.5 下载
+
+```bash
+curl -OJ http://127.0.0.1:8000/api/jobs/<job_id>/download/recon_result
+curl -OJ http://127.0.0.1:8000/api/jobs/<job_id>/download/recon_report
+```
+
+### 8.6 常见错误
+
+| 响应 | 原因 | 处理 |
+|---|---|---|
+| `400 INVALID_INPUT` | 表头/编码/文件类型不对 | 用 `recon run` 先在本地验证文件 |
+| `413 FILE_TOO_LARGE` | 超过 `RECON_MAX_UPLOAD_BYTES` | 调大配置或拆分文件 |
+| `404 JOB_NOT_FOUND` | 任务号错误 | 用 `GET /api/jobs` 找 |
+| `409 JOB_BUSY` | 后台正在跑 | 等状态变为 `awaiting_human` 再操作 |
+| `503 CONFIG_ERROR` | 选了 openai 但没配密钥 | 补 `LLM_*` 或改回 stub |
+
+## 9. 退出码
 
 | 退出码 | 含义 |
 |---|---|
