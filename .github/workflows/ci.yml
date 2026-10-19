@@ -43,3 +43,47 @@ jobs:
                     --out-dir out/ --quiet
           test -s out/recon_report.json
           test -s out/recon_result.xlsx
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t recon-workbench:ci .
+
+      - name: Start container
+        run: |
+          docker run -d --name recon-api -p 8000:8000 \
+            -e RECON_REVIEW_PROVIDER=stub recon-workbench:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/healthz > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          python -c "import json;d=json.load(open('/tmp/health.json'));assert d['status']=='ok',d"
+
+      - name: End-to-end upload and download
+        run: |
+          curl -fsS -X POST http://127.0.0.1:8000/api/jobs \
+            -F "ledger=@sample_data/ledger_2026_08.csv" \
+            -F "statement=@sample_data/statement_2026_08.xlsx" > /tmp/job.json
+          cat /tmp/job.json
+          JOB=$(python -c "import json;print(json.load(open('/tmp/job.json'))['job_id'])")
+          for _ in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:8000/api/jobs/$JOB" > /tmp/status.json
+            STATUS=$(python -c "import json;print(json.load(open('/tmp/status.json'))['status'])")
+            if [ "$STATUS" = "awaiting_human" ] || [ "$STATUS" = "completed" ]; then break; fi
+            sleep 1
+          done
+          python -c "import json;d=json.load(open('/tmp/status.json'));assert d['status'] in ('awaiting_human','completed'), d['status'];print('status:',d['status'],'pending:',len(d['pending']))"
+          curl -fsS -o /tmp/report.json "http://127.0.0.1:8000/api/jobs/$JOB/download/recon_report"
+          python -c "import json;d=json.load(open('/tmp/report.json'));assert d['digest'];print('digest:',d['digest'][:12])"
+
+      - name: Container logs
+        if: always()
+        run: docker logs recon-api
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f recon-api
