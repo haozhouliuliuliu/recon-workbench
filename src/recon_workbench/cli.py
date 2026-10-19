@@ -11,7 +11,6 @@ import argparse
 import json
 import sys
 from datetime import datetime
-from decimal import Decimal
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -20,7 +19,7 @@ from . import __version__
 from .config import Policy, load_policy
 from .errors import ConfigError, InputError, ReconError
 from .export import write_excel, write_report_json
-from .models import Report
+from .models import Report, Status
 from .pipeline import run_reconciliation, summarize
 from .review import (
     LLMSettings,
@@ -30,10 +29,26 @@ from .review import (
     StubClient,
     build_batch,
     build_requests,
+    demo_verdict,
     review_all,
 )
 from .review import (
     file_json as review_file_json,
+)
+from .workflow import (
+    HumanDecision,
+    JobNotFound,
+    ReviewSettings,
+    StageName,
+    StageStatus,
+    WorkflowError,
+    WorkflowStatus,
+    connect,
+    get_status,
+    list_jobs,
+    record_decision,
+    resume_job,
+    start_job,
 )
 
 EXIT_OK = 0
@@ -76,6 +91,58 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--dry-run", action="store_true", help="只打印将要复核的请求，不调用模型")
     review.add_argument("--now", default=None, help="覆盖报告生成时间（ISO 8601）")
     review.add_argument("--quiet", action="store_true", help="不打印逐条结论")
+
+    workflow = subparsers.add_parser("workflow", help="阶段 3：任务化对账、断点恢复与人工复核")
+    workflow_sub = workflow.add_subparsers(dest="workflow_command", required=True)
+
+    workflow_run = workflow_sub.add_parser("run", help="创建（或复用）任务并推进")
+    workflow_run.add_argument("--ledger", required=True, type=Path, help="内部应付台账（CSV / XLSX）")
+    workflow_run.add_argument("--statement", required=True, type=Path, help="供应商对账单（CSV / XLSX）")
+    workflow_run.add_argument("--db", type=Path, default=Path("data/recon.db"), help="SQLite 路径")
+    workflow_run.add_argument("--storage", type=Path, default=Path("data/jobs"), help="产物目录")
+    workflow_run.add_argument("--config", type=Path, default=None, help="TOML 策略文件")
+    workflow_run.add_argument("--no-review", action="store_true", help="跳过 LLM 复核阶段")
+    workflow_run.add_argument("--stub", action="store_true", help="用本地假响应复核（无需密钥）")
+    workflow_run.add_argument("--threshold", type=float, default=None, help="覆盖置信度阈值")
+    workflow_run.add_argument("--limit", type=int, default=20, help="最多复核多少条差异")
+    workflow_run.add_argument("--force", action="store_true", help="清空建议与人工决策后重跑")
+    workflow_run.add_argument("--quiet", action="store_true", help="只打印任务号")
+    workflow_run.add_argument("--json", action="store_true", help="以 JSON 打印任务状态")
+
+    workflow_status = workflow_sub.add_parser("status", help="查看任务状态")
+    workflow_status.add_argument("job_id", help="任务号")
+    workflow_status.add_argument("--db", type=Path, default=Path("data/recon.db"))
+    workflow_status.add_argument("--json", action="store_true", help="以 JSON 输出")
+    workflow_status.add_argument("--events", type=int, default=5, help="显示最近多少条事件")
+
+    workflow_list = workflow_sub.add_parser("list", help="列出任务")
+    workflow_list.add_argument("--db", type=Path, default=Path("data/recon.db"))
+    workflow_list.add_argument("--limit", type=int, default=20)
+    workflow_list.add_argument("--json", action="store_true")
+
+    workflow_resume = workflow_sub.add_parser("resume", help="从断点恢复任务")
+    workflow_resume.add_argument("job_id", help="任务号")
+    workflow_resume.add_argument("--db", type=Path, default=Path("data/recon.db"))
+    workflow_resume.add_argument("--storage", type=Path, default=Path("data/jobs"))
+    workflow_resume.add_argument("--stub", action="store_true", help="强制用假响应（任务原本是 stub 时自动使用）")
+    workflow_resume.add_argument("--quiet", action="store_true")
+    workflow_resume.add_argument("--json", action="store_true")
+
+    workflow_decide = workflow_sub.add_parser("decide", help="记录人工复核结论")
+    workflow_decide.add_argument("job_id", help="任务号")
+    workflow_decide.add_argument("item_id", help="差异条目 ID")
+    workflow_decide.add_argument(
+        "--decision",
+        required=True,
+        choices=[value.value for value in HumanDecision],
+        help="accepted 认可 / rejected 驳回 / needs_info 退回补充",
+    )
+    workflow_decide.add_argument("--by", required=True, dest="decided_by", help="操作人")
+    workflow_decide.add_argument("--note", default=None, help="备注")
+    workflow_decide.add_argument("--db", type=Path, default=Path("data/recon.db"))
+    workflow_decide.add_argument("--quiet", action="store_true")
+    workflow_decide.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -100,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args)
     if args.command == "review":
         return _cmd_review(args)
+    if args.command == "workflow":
+        return _cmd_workflow(args)
 
     parser.print_help()  # pragma: no cover - argparse 已保证
     return EXIT_INPUT
@@ -216,7 +285,7 @@ def _write_review_batch(batch, out_dir: Path) -> Path:
 
 def _build_review_client(args: argparse.Namespace, requests: list[ReviewRequest]):
     if args.stub:
-        client = StubClient([_demo_verdict(request) for request in requests])
+        client = StubClient([demo_verdict(request) for request in requests])
         threshold = args.threshold if args.threshold is not None else 0.85
         return ReviewPolicy(confidence_threshold=threshold, max_attempts=1), client
 
@@ -255,74 +324,245 @@ def _print_review_summary(batch, requests: list[ReviewRequest], output_path: Pat
     print(f"输出：{output_path}")
 
 
-def _demo_verdict(request: ReviewRequest) -> str:
-    """``--stub`` 演示用的确定性结论，只引用请求里已有的事实。"""
+def _cmd_workflow(args: argparse.Namespace) -> int:
+    if args.workflow_command == "run":
+        return _workflow_run(args)
+    if args.workflow_command == "status":
+        return _workflow_status(args)
+    if args.workflow_command == "list":
+        return _workflow_list(args)
+    if args.workflow_command == "resume":
+        return _workflow_resume(args)
+    if args.workflow_command == "decide":
+        return _workflow_decide(args)
+    print("未知的 workflow 子命令", file=sys.stderr)
+    return EXIT_INPUT
 
-    delta = Decimal(request.delta) if request.delta else None
-    base = {
-        "verdict": "needs_review",
-        "category": "other",
-        "confidence": 0.5,
-        "explanation": "仅凭当前对账事实无法判断差异原因。",
-        "recommended_action": "请人工核对合同、送货单与发票。",
-        "evidence": [f"状态 {request.status}"],
-    }
 
-    if request.status == "amount_mismatch" and delta is not None and abs(delta) <= Decimal("300"):
-        base.update(
-            {
-                "verdict": "approve",
-                "category": "amount_diff",
-                "confidence": 0.91,
-                "explanation": (
-                    f"台账 {request.ledger_amount} 与对账单 {request.statement_amount} "
-                    f"相差 {request.delta}，差异金额很小，可能为运费或四舍五入尾差。"
-                ),
-                "recommended_action": "按对账单金额确认差异，并要求供应商补充差异说明。",
-                "evidence": [
-                    f"台账金额 {request.ledger_amount}",
-                    f"对账单金额 {request.statement_amount}",
-                    f"差额 {request.delta}",
-                ],
-            }
+def _workflow_review_settings(args: argparse.Namespace):
+    if args.no_review:
+        return ReviewSettings(enabled=False), None
+
+    if args.stub:
+        review = ReviewSettings(
+            enabled=True,
+            provider="stub",
+            model="stub-model",
+            threshold=args.threshold if args.threshold is not None else 0.85,
+            max_attempts=1,
+            limit=args.limit,
         )
-    elif request.status == "only_in_ledger":
-        base.update(
-            {
-                "verdict": "needs_review",
-                "category": "missing_in_statement",
-                "confidence": 0.58,
-                "explanation": (
-                    f"台账记录了 {request.invoice_no}，但供应商对账单中没有这张票，可能对方漏记或本期未结算。"
-                ),
-                "recommended_action": "向供应商确认该发票是否已开具、是否计入本期对账单。",
-                "evidence": [f"发票号 {request.invoice_no}", f"台账金额 {request.ledger_amount}"],
-            }
+        return review, lambda requests: StubClient([demo_verdict(request) for request in requests])
+
+    settings = LLMSettings.from_env()
+    review = ReviewSettings(
+        enabled=True,
+        provider="openai-compatible",
+        model=settings.model,
+        threshold=args.threshold if args.threshold is not None else settings.confidence_threshold,
+        max_attempts=settings.max_attempts,
+        limit=args.limit,
+    )
+    return review, lambda requests: OpenAICompatibleClient(settings)
+
+
+def _workflow_run(args: argparse.Namespace) -> int:
+    try:
+        review, provider = _workflow_review_settings(args)
+        policy = _resolve_policy(args.config)
+    except ConfigError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_INPUT
+
+    connection = connect(args.db)
+    try:
+        status = start_job(
+            connection,
+            ledger_path=args.ledger,
+            statement_path=args.statement,
+            storage_dir=args.storage,
+            policy=policy,
+            review=review,
+            client_provider=provider,
+            force=args.force,
         )
-    elif request.status == "only_in_statement":
-        base.update(
-            {
-                "verdict": "needs_review",
-                "category": "missing_in_ledger",
-                "confidence": 0.55,
-                "explanation": f"对账单出现了 {request.invoice_no}，但内部台账没有对应记录，可能未入账或重复开票。",
-                "recommended_action": "核对采购入库单与发票原件，确认是否补入台账。",
-                "evidence": [f"发票号 {request.invoice_no}", f"对账单金额 {request.statement_amount}"],
-            }
+    except (InputError, WorkflowError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_INPUT
+    finally:
+        connection.close()
+
+    return _emit_workflow_status(status, args)
+
+
+def _workflow_status(args: argparse.Namespace) -> int:
+    connection = connect(args.db)
+    try:
+        status = get_status(connection, args.job_id)
+    except JobNotFound as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_INPUT
+    finally:
+        connection.close()
+
+    if args.json:
+        print(status.model_dump_json(indent=2))
+    else:
+        print(_format_workflow(status, events=args.events))
+    return EXIT_OK
+
+
+def _workflow_list(args: argparse.Namespace) -> int:
+    connection = connect(args.db)
+    try:
+        jobs = list_jobs(connection, args.limit)
+    finally:
+        connection.close()
+
+    if args.json:
+        payload = [job.model_dump(mode="json") for job in jobs]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return EXIT_OK
+
+    if not jobs:
+        print("暂无任务")
+        return EXIT_OK
+    print(f"{'任务号':<18} {'状态':<16} {'待人工':>5}  {'台账':<24} {'对账单':<24}")
+    for job in jobs:
+        print(
+            f"{job.job_id:<18} {job.status:<16} {job.pending_count:>5}  "
+            f"{job.ledger_filename:<24} {job.statement_filename:<24}"
         )
-    elif request.status == "duplicate":
-        base.update(
-            {
-                "verdict": "needs_review",
-                "category": "duplicate",
-                "confidence": 0.52,
-                "explanation": "同一发票号在来源文件中出现多次，需要确认是否为重复录入。",
-                "recommended_action": "人工确认后删除重复行，并检查导入流程。",
-                "evidence": [f"发票号 {request.invoice_no}"],
-            }
+    return EXIT_OK
+
+
+def _workflow_resume(args: argparse.Namespace) -> int:
+    connection = connect(args.db)
+    try:
+        current = get_status(connection, args.job_id)
+        if not current.review_enabled:
+            provider = None
+        elif args.stub or current.review_provider == "stub":
+            provider = lambda requests: StubClient([demo_verdict(request) for request in requests])  # noqa: E731
+        else:
+            provider = lambda requests: OpenAICompatibleClient(LLMSettings.from_env())  # noqa: E731
+
+        status = resume_job(
+            connection,
+            args.job_id,
+            storage_dir=args.storage,
+            client_provider=provider,
+        )
+    except (JobNotFound, InputError, WorkflowError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_INPUT
+    finally:
+        connection.close()
+
+    return _emit_workflow_status(status, args)
+
+
+def _workflow_decide(args: argparse.Namespace) -> int:
+    connection = connect(args.db)
+    try:
+        status = record_decision(
+            connection,
+            job_id=args.job_id,
+            item_id=args.item_id,
+            decision=args.decision,
+            decided_by=args.decided_by,
+            note=args.note,
+        )
+    except (JobNotFound, WorkflowError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return EXIT_INPUT
+    finally:
+        connection.close()
+
+    return _emit_workflow_status(status, args)
+
+
+def _emit_workflow_status(status: WorkflowStatus, args: argparse.Namespace) -> int:
+    if args.json:
+        print(status.model_dump_json(indent=2))
+    elif args.quiet:
+        print(status.job_id)
+    else:
+        print(_format_workflow(status))
+    return EXIT_DIFFERENCE if status.status == "failed" else EXIT_OK
+
+
+JOB_STATUS_LABELS = {
+    "pending": "待执行",
+    "running": "执行中",
+    "awaiting_human": "待人工复核",
+    "completed": "已完成",
+    "failed": "失败",
+}
+
+
+def _format_workflow(status: WorkflowStatus, *, events: int = 5) -> str:
+    lines = [
+        f"任务 {status.job_id}  状态：{JOB_STATUS_LABELS.get(status.status, status.status)}",
+        f"输入：{status.ledger_filename} / {status.statement_filename}",
+        "阶段：",
+    ]
+    for stage in status.stages:
+        name = StageName(stage.stage).label_zh
+        line = f"  - {name:<8} {StageStatus(stage.status).label_zh}（尝试 {stage.attempts}）"
+        if stage.error:
+            line += f" 错误：{stage.error}"
+        lines.append(line)
+
+    if status.counts:
+        counts = " / ".join(f"{_status_label(name)} {value}" for name, value in sorted(status.counts.items()))
+        lines.append(f"对账结果：{counts}")
+
+    if status.review_enabled:
+        auto = sum(1 for item in status.suggestions if item.status == "auto_suggested")
+        manual = sum(1 for item in status.suggestions if item.status == "manual_review")
+        failed = sum(1 for item in status.suggestions if item.status == "failed")
+        lines.append(
+            f"复核建议：建议采纳 {auto} / 转人工 {manual} / 失败 {failed}"
+            f"（{status.review_provider} / {status.review_model}，阈值 {status.review_threshold}）"
         )
 
-    return json.dumps(base, ensure_ascii=False)
+    decided = len(status.decisions)
+    lines.append(f"人工决策：{decided} / {decided + len(status.pending)} 条差异")
+
+    if status.pending:
+        suggestions = {item.item_id: item for item in status.suggestions}
+        lines.append(f"待人工决策 {len(status.pending)} 条：")
+        for item in status.pending[:10]:
+            suggestion = suggestions.get(item.item_id)
+            extra = ""
+            if suggestion is not None:
+                if suggestion.verdict:
+                    extra = f"  建议 {suggestion.verdict}({suggestion.confidence or 0:.2f})"
+                elif suggestion.error_code:
+                    extra = f"  建议失败 {suggestion.error_code}"
+            lines.append(
+                f"  - {item.item_id}  {item.invoice_no}  {_status_label(item.status)}  差额 {item.delta or '—'}{extra}"
+            )
+        if len(status.pending) > 10:
+            lines.append(f"  …还有 {len(status.pending) - 10} 条")
+
+    if status.error:
+        lines.append(f"错误：{status.error}")
+
+    if events and status.events:
+        lines.append("最近事件：")
+        for event in status.events[:events]:
+            detail = f"  {event.detail}" if event.detail else ""
+            lines.append(f"  {event.at}  {event.event}{detail}")
+    return "\n".join(lines)
+
+
+def _status_label(value: str) -> str:
+    try:
+        return Status(value).label_zh
+    except ValueError:
+        return value
 
 
 if __name__ == "__main__":  # pragma: no cover
