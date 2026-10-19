@@ -77,6 +77,10 @@ statement.xlsx ┘                                                   └─► r
 | `src/recon_workbench/review/client.py` | OpenAI 兼容客户端、环境配置、Stub |
 | `src/recon_workbench/review/service.py` | 重试、修复、路由、请求构造 |
 | `src/recon_workbench/review/report.py` | 复核批次报告与摘要 |
+| `src/recon_workbench/workflow/db.py` | SQLite 连接、schema、事务 |
+| `src/recon_workbench/workflow/repository.py` | 纯 SQL 数据访问（幂等 upsert） |
+| `src/recon_workbench/workflow/models.py` | 工作流视图模型与状态枚举 |
+| `src/recon_workbench/workflow/service.py` | 任务身份、阶段推进、恢复、人工决策 |
 
 ## 6. LLM 审核层（阶段 2）
 
@@ -131,3 +135,56 @@ ReviewRequest ──► prompt ──► ChatClient ──► 原始文本
 
 `ReviewOutcome` 是纯数据模型，可直接序列化进 SQLite；`failed` 与 `manual_review` 会作为
 "待人工"状态进入工作流，`auto_suggested` 也只是"建议已生成"，不改变单据状态。
+
+## 7. 工作流与状态机（阶段 3）
+
+### 7.1 表结构
+
+```text
+jobs              任务身份与输入指纹、整体状态、两个阶段的报告摘要
+  ├── job_stages      每个阶段的 status / attempts / started_at / error
+  ├── recon_items     对账明细快照（12 条，含 matched）
+  ├── review_suggestions   LLM 建议（每条差异一行）
+  ├── human_decisions      人工结论（每条差异一行，与建议互不覆盖）
+  ├── job_events      追加式事件日志（阶段开始/成功/失败/中断、人工决策）
+  └── artifacts       产物路径与 SHA-256（报告、Excel）
+```
+
+主键统一为 `(job_id, ...)` 或 `(job_id, stage)`，数据库层面挡住重复写入。
+
+### 7.2 阶段推进
+
+```text
+start_job
+  ├─ 读表拿 sha256 → 计算 job_id → INSERT ON CONFLICT DO NOTHING
+  ├─ reconcile: pending → running → succeeded   （失败则 failed + job failed）
+  ├─ review:    pending → running → succeeded   （可 skipped）
+  └─ finalize:  pending_items ? awaiting_human : completed
+```
+
+- `run_job` 先看阶段状态：`succeeded` 直接跳过，其余重跑；
+- `resume_job` 额外把 `running` 标成 `interrupted` 再走 `run_job`；
+- 复核阶段**逐条 upsert**，因此崩溃后恢复只补未完成的条目，不重复调用模型。
+
+### 7.3 幂等边界
+
+| 操作 | 幂等 | 说明 |
+|---|---|---|
+| 重复 `workflow run` | ✅ | 同 job_id，阶段不重跑，不新增行 |
+| 崩溃后 `resume` | ✅ | 已成功阶段跳过；建议按 item 去重 |
+| 修改人工结论 | ✅ | upsert 同一行，事件留痕 |
+| `--force` | 有损 | 清空建议与人工决策，用于输入未变但想重跑 |
+| 输入变化 | 新任务 | job_id 变化，旧任务与决策保留在库 |
+
+### 7.4 为什么人工决策要单独一张表
+
+LLM 建议与人工结论是两类事实：前者是"模型说了什么"，后者是"人定了什么"。
+放在同一条记录里更新，会让审计无法回答"模型原话是否被改过"。
+因此 `review_suggestions` 只写模型输出，`human_decisions` 只写人工动作，
+状态查询时按 `(job_id, item_id)` 拼起来展示。
+
+### 7.5 并发与部署边界
+
+当前假设**单机、单写进程**：SQLite 开 WAL 与 `busy_timeout=5s`，能容忍 CLI/测试/后续 API 的轻度并发，
+但没有任务级锁。同一任务被两个进程同时 `resume` 时，阶段可能各跑一次（结果仍幂等，但会重复调用模型）。
+阶段 4 引入 API 后，用进程内锁或"阶段抢占"字段解决。

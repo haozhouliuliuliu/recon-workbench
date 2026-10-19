@@ -36,7 +36,10 @@ secrets/
 out/
 output/
 artifacts/
+data/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 *.log

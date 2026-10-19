@@ -57,6 +57,21 @@ recon --version
 pytest -q
 ```
 
+## 数据与备份（阶段 3）
+
+任务模式会在本地生成：
+
+| 路径 | 内容 |
+|---|---|
+| `data/recon.db` | SQLite：任务、阶段、明细、LLM 建议、人工决策、事件 |
+| `data/recon.db-wal` / `-shm` | WAL 日志，运行中属正常现象 |
+| `data/jobs/<job_id>/` | 对账报告、Excel、复核报告 |
+
+备份建议：**停掉 CLI/服务后**，整体复制 `data/` 目录，或使用 SQLite 的在线备份接口。
+只拷 `recon.db` 而漏掉 `-wal` 可能丢最后几笔事务；只拷数据库而漏掉 `data/jobs/` 会丢报告产物（数据库里仍保留路径与哈希，可发现不一致）。
+
+恢复时把 `data/` 放回原位即可；若源文件路径变化，`workflow resume` 会提示，需要重新建任务。
+
 ## 离线环境
 
 运行时依赖：`openpyxl`、`pydantic`、`httpx`。可在有网机器上执行：

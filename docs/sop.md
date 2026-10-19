@@ -111,7 +111,58 @@ recon review --report out/recon_report.json --threshold 0.85
 
 > 失败会以退出码 `1` 结束，便于定时任务/CI 感知；不会把失败静默成"通过"。
 
-## 6. 留痕
+## 6. 任务化模式（阶段 3）
+
+阶段 1/2 是"一次性命令"，每次都要自己记住输出在哪。阶段 3 把对账、复核、人工决策串成任务：
+
+### 6.1 建任务
+
+```bash
+recon workflow run --ledger 台账.csv --statement 对账单.xlsx --stub
+```
+
+- 默认数据库 `data/recon.db`，产物 `data/jobs/<job_id>/`；
+- 相同内容重复执行会复用同一任务，不会重跑已成功的阶段；
+- `--no-review` 只跑对账；真实复核去掉 `--stub`，先配好 LLM 环境变量。
+
+输出会直接告诉你：阶段状态、对账结果、建议分布、待人工条数。
+
+### 6.2 看任务
+
+```bash
+recon workflow status J584bb23c789d9e42
+recon workflow status J584bb23c789d9e42 --json
+recon workflow list
+```
+
+### 6.3 记录人工结论
+
+```bash
+recon workflow decide J584bb23c789d9e42 I080065789730 \
+      --decision accepted --by 张会计 --note "270 元为运费，已核实"
+```
+
+- `accepted` 认可 / `rejected` 驳回 / `needs_info` 退回补充；
+- 人工结论与 LLM 建议分开存储，**不会覆盖模型原话**；
+- 只有全部差异都有结论，任务才会变成 `completed`。
+
+### 6.4 中断与恢复
+
+进程被杀、断电、机器重启后：
+
+1. `workflow status` 会显示停在哪个阶段（`running` 或 `failed`）以及最后一次错误；
+2. `workflow resume <job_id>` 继续：已成功的阶段不重跑，复核只补没做完的条目，不重复烧 token；
+3. 如果提示"源文件已变化/不存在"，说明输入被动过，需恢复原文件或重建任务。
+
+### 6.5 重跑
+
+```bash
+recon workflow run ... --force
+```
+
+`--force` 会清空该任务的建议与人工决策后重跑，属于破坏性操作，先确认。
+
+## 7. 留痕
 
 每次运行都会生成：
 
@@ -119,13 +170,18 @@ recon review --report out/recon_report.json --threshold 0.85
 - `out/recon_result.xlsx`：给人看的结果
 - `out/review_report.json`：LLM 复核批次（含 provider、model、阈值、逐条结论与摘要）
 
-把这三个文件和原始两份输入一起归档，事后可完整复现当次结论。
+任务模式额外保留：
 
-## 7. 退出码
+- `data/recon.db`：任务、阶段、明细、建议、人工决策、事件
+- `data/jobs/<job_id>/recon_report.json`、`recon_result.xlsx`、`review_report.json`
+
+把输入文件、`data/` 目录一起归档，事后可完整复现当次结论与人工动作。
+
+## 8. 退出码
 
 | 退出码 | 含义 |
 |---|---|
-| 0 | 跑完，无阻断性问题 |
-| 1 | 跑完，但存在差异（`--fail-on-difference`）或复核存在 `failed` |
+| 0 | 跑完，无阻断性问题（任务模式下含"待人工"） |
+| 1 | 跑完，但存在差异（`--fail-on-difference`）、复核存在 `failed`，或任务失败 |
 | 2 | 命令行参数错误 |
-| 3 | 输入文件/配置/环境变量不可用 |
+| 3 | 输入文件/配置/环境变量/任务号不可用 |
