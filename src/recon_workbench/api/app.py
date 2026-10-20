@@ -206,6 +206,17 @@ async def _read_upload(upload: UploadFile, limit: int) -> tuple[bytes, str]:
     return b"".join(chunks), suffix
 
 
+def _parse_review(value: str | bool | None) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ApiError(422, "VALIDATION_ERROR", "review 只能是 true 或 false")
+
+
 def _resolve_review(settings: AppSettings, override: bool | None) -> ReviewSettings:
     if override is False:
         return ReviewSettings(enabled=False)
@@ -294,12 +305,12 @@ def _register_routes(app: FastAPI) -> None:
         background: BackgroundTasks,
         ledger: Annotated[UploadFile, File(description="内部应付台账 CSV/XLSX")],
         statement: Annotated[UploadFile, File(description="供应商对账单 CSV/XLSX")],
-        review: bool | None = Form(default=None, description="是否执行 LLM 复核，缺省用服务配置"),
+        review: str | None = Form(default=None, description="是否执行 LLM 复核（true/false），缺省用服务配置"),
     ) -> JobAccepted:
         settings = _settings(request)
         locks = _locks(request)
 
-        review_settings = _resolve_review(settings, review)
+        review_settings = _resolve_review(settings, _parse_review(review))
         policy = settings.policy()
 
         ledger_bytes, ledger_suffix = await _read_upload(ledger, settings.max_upload_bytes)
